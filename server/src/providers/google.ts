@@ -5,6 +5,7 @@ import type {
   ChatToolCall,
   ChatToolChoice,
   ChatToolDefinition,
+  ReasoningEffort,
   TokenUsage,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
@@ -14,6 +15,11 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 interface GeminiPart {
   text?: string;
+  thought?: boolean;
+  inlineData?: {
+    mimeType: string;
+    data: string;
+  };
   thoughtSignature?: string;
   functionCall?: {
     id?: string;
@@ -37,7 +43,74 @@ interface GeminiResponse {
   usageMetadata?: {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
     totalTokenCount?: number;
+  };
+}
+
+const GEMINI_THINKING_BUDGETS: Record<ReasoningEffort, number> = {
+  minimal: 512,
+  low: 1024,
+  medium: 8192,
+  high: 24576,
+};
+
+const GEMINI_THINKING_LEVELS: Record<ReasoningEffort, string> = {
+  minimal: 'MINIMAL',
+  low: 'LOW',
+  medium: 'MEDIUM',
+  high: 'HIGH',
+};
+
+function isGemini3Model(modelId: string): boolean {
+  return /^gemini-3\./i.test(modelId);
+}
+
+function isGemini31Pro(modelId: string): boolean {
+  return /^gemini-3\.1-pro(?:$|[-:])/i.test(modelId);
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(Math.max(n, min), max);
+}
+
+function thinkingBudgetFor(modelId: string, effort: ReasoningEffort): number {
+  const normalized = modelId.toLowerCase();
+  const baseBudget = effort === 'minimal' && normalized.includes('pro')
+    ? 128
+    : GEMINI_THINKING_BUDGETS[effort];
+
+  if (normalized.includes('gemini-2.5-pro')) {
+    return clamp(baseBudget, 128, 24576);
+  }
+
+  if (normalized.includes('flash-lite')) {
+    return clamp(baseBudget, 512, 24576);
+  }
+
+  if (normalized.includes('flash')) {
+    return clamp(baseBudget, 0, 24576);
+  }
+
+  return clamp(baseBudget, 0, 24576);
+}
+
+function toGeminiThinkingConfig(modelId: string, effort?: ReasoningEffort): Record<string, unknown> | undefined {
+  if (!effort) return undefined;
+
+  if (isGemini3Model(modelId)) {
+    const thinkingLevel = effort === 'minimal' && isGemini31Pro(modelId)
+      ? 'LOW'
+      : GEMINI_THINKING_LEVELS[effort];
+    return {
+      thinkingLevel,
+      includeThoughts: true,
+    };
+  }
+
+  return {
+    thinkingBudget: thinkingBudgetFor(modelId, effort),
+    includeThoughts: true,
   };
 }
 
@@ -130,10 +203,75 @@ function toGeminiToolConfig(toolChoice?: ChatToolChoice): { functionCallingConfi
   };
 }
 
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB cap on fetched/inlined images
+
+// Pull the URL out of an OpenAI image content block. Accepts both the object
+// form `{ image_url: { url } }` and the shorthand `{ image_url: '...' }`.
+function extractImageUrl(block: unknown): string | undefined {
+  const iu = (block as { image_url?: unknown })?.image_url;
+  if (typeof iu === 'string') return iu;
+  if (iu && typeof (iu as { url?: unknown }).url === 'string') return (iu as { url: string }).url;
+  return undefined;
+}
+
+// Convert an image URL to a Gemini inlineData part. Handles base64 `data:` URLs
+// directly; for `http(s)` URLs we fetch and inline because the Gemini API does
+// not fetch external URLs itself. Fetching a user-supplied URL is a minor SSRF
+// surface, acceptable for a single-user self-hosted proxy; we still restrict to
+// http/https and cap the size. Returns null (part skipped) on any failure.
+async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; data: string } | null> {
+  const dataMatch = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
+  if (dataMatch) {
+    const mimeType = dataMatch[1] || 'application/octet-stream';
+    const isBase64 = Boolean(dataMatch[2]);
+    const payload = dataMatch[3] ?? '';
+    const data = isBase64
+      ? payload
+      : Buffer.from(decodeURIComponent(payload)).toString('base64');
+    return { mimeType, data };
+  }
+  if (/^https?:\/\//i.test(url)) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
+      const mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/jpeg';
+      return { mimeType, data: buf.toString('base64') };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// Build Gemini parts for a user message: joined text first, then any images as
+// inlineData. Non-array content (string/null) collapses to a single text part.
+async function userContentToParts(content: ChatMessage['content']): Promise<GeminiPart[]> {
+  const parts: GeminiPart[] = [];
+  const text = contentToString(content);
+  if (text.length > 0) parts.push({ text });
+
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      const type = (block as { type?: string })?.type;
+      if (type !== 'image_url' && type !== 'image') continue;
+      const url = extractImageUrl(block);
+      if (!url) continue;
+      const inlineData = await imageUrlToInlineData(url);
+      if (inlineData) parts.push({ inlineData });
+    }
+  }
+
+  // Gemini rejects empty `parts`; keep at least one (possibly empty) text part.
+  if (parts.length === 0) parts.push({ text: '' });
+  return parts;
+}
+
 // Translate OpenAI messages to Gemini format. Content may arrive as a string,
-// null, or the OpenAI multimodal array envelope — flatten to string first so
-// system/user/tool messages all surface as `parts: [{ text }]` for Gemini.
-function toGeminiContents(messages: ChatMessage[]) {
+// null, or the OpenAI multimodal array envelope. System/assistant/tool messages
+// flatten to text; user messages additionally carry images as inlineData parts.
+async function toGeminiContents(messages: ChatMessage[]) {
   const systemMessages = messages
     .filter(m => m.role === 'system')
     .map(m => contentToString(m.content))
@@ -146,9 +284,9 @@ function toGeminiContents(messages: ChatMessage[]) {
     }
   }
 
-  const contents = messages
+  const contents = (await Promise.all(messages
     .filter(m => m.role !== 'system')
-    .map((m): { role: 'user' | 'model'; parts: GeminiPart[] } | null => {
+    .map(async (m): Promise<{ role: 'user' | 'model'; parts: GeminiPart[] } | null> => {
       if (m.role === 'assistant') {
         const parts: GeminiPart[] = [];
 
@@ -196,9 +334,9 @@ function toGeminiContents(messages: ChatMessage[]) {
 
       return {
         role: 'user',
-        parts: [{ text: contentToString(m.content) }],
+        parts: await userContentToParts(m.content),
       };
-    })
+    })))
     .filter((entry): entry is { role: 'user' | 'model'; parts: GeminiPart[] } => entry !== null);
 
   return {
@@ -232,9 +370,10 @@ function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
   return calls;
 }
 
-function extractText(parts: GeminiPart[] | undefined): string | null {
+function extractText(parts: GeminiPart[] | undefined, thought: boolean): string | null {
   if (!parts) return null;
   const text = parts
+    .filter(p => Boolean(p.thought) === thought)
     .map(p => p.text ?? '')
     .join('');
   return text.length > 0 ? text : null;
@@ -250,7 +389,7 @@ export class GoogleProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    const { contents, systemInstruction } = toGeminiContents(messages);
+    const { contents, systemInstruction } = await toGeminiContents(messages);
 
     const body: Record<string, unknown> = {
       contents,
@@ -258,6 +397,7 @@ export class GoogleProvider extends BaseProvider {
         temperature: options?.temperature,
         maxOutputTokens: options?.max_tokens,
         topP: options?.top_p,
+        thinkingConfig: toGeminiThinkingConfig(modelId, options?.reasoning_effort),
       },
       tools: toGeminiTools(options?.tools),
       toolConfig: toGeminiToolConfig(options?.tool_choice),
@@ -280,12 +420,16 @@ export class GoogleProvider extends BaseProvider {
     const candidate = data.candidates?.[0];
     const parts = candidate?.content?.parts;
     const toolCalls = extractToolCalls(parts);
-    const text = extractText(parts);
+    const text = extractText(parts, false);
+    const reasoningText = extractText(parts, true);
 
     const usage: TokenUsage = {
       prompt_tokens: data.usageMetadata?.promptTokenCount ?? 0,
       completion_tokens: data.usageMetadata?.candidatesTokenCount ?? 0,
       total_tokens: data.usageMetadata?.totalTokenCount ?? 0,
+      ...(typeof data.usageMetadata?.thoughtsTokenCount === 'number'
+        ? { completion_tokens_details: { reasoning_tokens: data.usageMetadata.thoughtsTokenCount } }
+        : {}),
     };
 
     return {
@@ -298,6 +442,7 @@ export class GoogleProvider extends BaseProvider {
         message: {
           role: 'assistant',
           content: text,
+          ...(reasoningText ? { reasoning_content: reasoningText } : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: toolCalls.length > 0 ? 'tool_calls' : toGeminiFinishReason(candidate?.finishReason),
@@ -313,7 +458,7 @@ export class GoogleProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const { contents, systemInstruction } = toGeminiContents(messages);
+    const { contents, systemInstruction } = await toGeminiContents(messages);
 
     const body: Record<string, unknown> = {
       contents,
@@ -321,6 +466,7 @@ export class GoogleProvider extends BaseProvider {
         temperature: options?.temperature,
         maxOutputTokens: options?.max_tokens,
         topP: options?.top_p,
+        thinkingConfig: toGeminiThinkingConfig(modelId, options?.reasoning_effort),
       },
       tools: toGeminiTools(options?.tools),
       toolConfig: toGeminiToolConfig(options?.tool_choice),
@@ -392,7 +538,8 @@ export class GoogleProvider extends BaseProvider {
         const candidate = chunk.candidates?.[0];
         const parts = candidate?.content?.parts ?? [];
 
-        const text = extractText(parts);
+        const text = extractText(parts, false);
+        const reasoningText = extractText(parts, true);
         const toolCalls = extractToolCalls(parts).filter(call => {
           const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
           if (seenToolCallKeys.has(key)) return false;
@@ -400,7 +547,7 @@ export class GoogleProvider extends BaseProvider {
           return true;
         });
 
-        if ((text && text.length > 0) || toolCalls.length > 0) {
+        if ((text && text.length > 0) || (reasoningText && reasoningText.length > 0) || toolCalls.length > 0) {
           sawToolCalls = sawToolCalls || toolCalls.length > 0;
           yield {
             id,
@@ -411,6 +558,7 @@ export class GoogleProvider extends BaseProvider {
               index: 0,
               delta: {
                 ...(text ? { content: text } : {}),
+                ...(reasoningText ? { reasoning_content: reasoningText } : {}),
                 ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
               },
               finish_reason: null,
